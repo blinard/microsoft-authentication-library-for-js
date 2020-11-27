@@ -108,6 +108,97 @@ export abstract class ClientApplication {
         this.defaultAuthority = null;
     }
 
+    // #region Chrome Extension Flow
+
+    async getLoginStartUrl(request: RedirectRequest): Promise<string> {
+        // Preflight request
+        // TODO: Check this out....possibly add new InteractionType, verify it's making the right checks for this scenario.
+        this.preflightBrowserEnvironmentCheck(InteractionType.Redirect);
+
+        // TODO: Emit appropriate event for telemetry
+        
+        const validRequest: AuthorizationUrlRequest = this.preflightInteractiveRequest(request, InteractionType.Redirect);
+        const serverTelemetryManager = this.initializeServerTelemetryManager(ApiId.acquireTokenRedirect, validRequest.correlationId);
+
+        try {
+            // Create auth code request and generate PKCE params
+            const authCodeRequest: AuthorizationCodeRequest = await this.initializeAuthorizationCodeRequest(validRequest);
+
+            // Initialize the client
+            const authClient: AuthorizationCodeClient = await this.createAuthCodeClient(serverTelemetryManager, validRequest.authority);
+
+            // Create redirect interaction handler.
+            const interactionHandler = new RedirectHandler(authClient, this.browserStorage, this.browserCrypto);
+
+            // Create acquire token url.
+            const navigateUrl = await authClient.getAuthCodeUrl(validRequest);
+
+            const redirectStartPage = (request && request.redirectStartPage) || window.location.href;
+
+            // Show the UI once the url has been created. Response will come back in the hash, which will be handled in the handleRedirectCallback function.
+            //return interactionHandler.initiateAuthRequest(navigateUrl, authCodeRequest, this.config.system.redirectNavigationTimeout, redirectStartPage);
+
+            if (!StringUtils.isEmpty(navigateUrl)) {
+                // Cache start page, returns to this page after redirectUri if navigateToLoginRequestUrl is true
+                if (redirectStartPage) {
+                    this.browserStorage.setTemporaryCache(TemporaryCacheKeys.ORIGIN_URI, redirectStartPage, true);
+                }
+    
+                // Set interaction status in the library.
+                //this.browserStorage.setTemporaryCache(BrowserConstants.INTERACTION_STATUS_KEY, BrowserConstants.INTERACTION_IN_PROGRESS_VALUE, true);
+                this.browserStorage.cacheCodeRequest(authCodeRequest, this.browserCrypto);
+                authClient.logger.infoPii("Navigate to:" + navigateUrl);
+
+                return navigateUrl;
+            } else {
+                // Throw error if request URL is empty.
+                authClient.logger.info("Navigate url is empty");
+                throw BrowserAuthError.createEmptyNavigationUriError();
+            }
+    
+        } catch (e) {
+            // TODO: Emit failure event
+            
+            serverTelemetryManager.cacheFailedRequest(e);
+            this.browserStorage.cleanRequest(validRequest.state);
+            throw e;
+        }
+    }
+
+    async handleChromeExtensionRedirect(hash: string): Promise<AuthenticationResult | null> {
+        //const responseHash = this.getRedirectResponseHash(hash);
+        const responseHash = hash;
+        if (StringUtils.isEmpty(responseHash)) {
+            // Not a recognized server response hash or hash not associated with a redirect request
+            return null;
+        }
+
+        //const authResult = this.handleHash(responseHash);
+        const encodedTokenRequest = this.browserStorage.getTemporaryCache(TemporaryCacheKeys.REQUEST_PARAMS, true);
+        const cachedRequest = JSON.parse(this.browserCrypto.base64Decode(encodedTokenRequest)) as AuthorizationCodeRequest;
+        const serverTelemetryManager = this.initializeServerTelemetryManager(ApiId.handleRedirectPromise, cachedRequest.correlationId);
+
+        // Deserialize hash fragment response parameters.
+        const serverParams = BrowserProtocolUtils.parseServerResponseFromHash(responseHash);
+
+        try {
+            // Hash contains known properties - handle and return in callback
+            const currentAuthority = this.browserStorage.getCachedAuthority(serverParams.state);
+            const authClient = await this.createAuthCodeClient(serverTelemetryManager, currentAuthority);
+            const interactionHandler = new RedirectHandler(authClient, this.browserStorage, this.browserCrypto);
+            const authResult = await interactionHandler.handleCodeResponse(responseHash, this.config.auth.clientId);
+
+            // TODO: DON'T FORGET TO LOG TELEMETRY FOR LOGIN SUCCESS/FAILURE
+            return authResult;
+        } catch (e) {
+            serverTelemetryManager.cacheFailedRequest(e);
+            this.browserStorage.cleanRequest(serverParams.state);
+            throw e;
+        }
+    }
+
+    // #endregion
+
     // #region Redirect Flow
 
     /**
